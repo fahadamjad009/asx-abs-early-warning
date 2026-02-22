@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+data/
+artifacts/*.joblib
+artifacts/*.pkl
+artifacts/*.parquet
+artifacts/*.csv
+artifacts/*.json
+reports/figures/*.png
+*.log
