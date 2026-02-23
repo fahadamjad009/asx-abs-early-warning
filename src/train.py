@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
+import numpy as np
 from joblib import dump
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier
@@ -12,6 +14,7 @@ from sklearn.metrics import (
     average_precision_score,
     classification_report,
     confusion_matrix,
+    precision_recall_curve,
 )
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
@@ -25,6 +28,37 @@ from .preprocessing import (
     build_full_feature_frame,
 )
 from .utils import ARTIFACTS, FIGURES, write_json, ensure_dirs
+
+# Optional polish: silence loky "physical cores" warning on some Windows setups.
+# Set to your logical core count if you want (doesn't affect results).
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "8")
+
+
+def _best_f1_threshold(y_true: np.ndarray, proba: np.ndarray) -> Dict[str, float]:
+    """
+    Pick a probability threshold that maximizes F1 on the provided labels/probabilities.
+    Returns dict: threshold, precision, recall, f1.
+    """
+    precision, recall, thresholds = precision_recall_curve(y_true, proba)
+
+    # precision_recall_curve returns precision/recall arrays length n_thresholds+1
+    # thresholds length n_thresholds; align by trimming last p/r entry
+    precision = precision[:-1]
+    recall = recall[:-1]
+
+    denom = precision + recall
+    f1 = np.where(denom > 0, 2 * (precision * recall) / denom, 0.0)
+
+    if len(thresholds) == 0:
+        return {"threshold": 0.5, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    idx = int(np.argmax(f1))
+    return {
+        "threshold": float(thresholds[idx]),
+        "precision": float(precision[idx]),
+        "recall": float(recall[idx]),
+        "f1": float(f1[idx]),
+    }
 
 
 def train(
@@ -72,7 +106,6 @@ def train(
         n_jobs=-1,
     )
 
-    # Handle imbalance after preprocessing via SMOTE
     model = ImbPipeline(
         steps=[
             ("pre", pre),
@@ -81,53 +114,66 @@ def train(
         ]
     )
 
-    # Calibrate for probability quality
     calibrated = CalibratedClassifierCV(model, method="isotonic", cv=3)
     calibrated.fit(X_train, y_train)
 
-    # Evaluate
     proba = calibrated.predict_proba(X_test)[:, 1]
-    pred = (proba >= 0.5).astype(int)
+
+    # ---- key upgrade: choose threshold instead of hard 0.5 ----
+    thr_info = _best_f1_threshold(y_test.to_numpy(), proba)
+    threshold = float(thr_info["threshold"])
+    pred = (proba >= threshold).astype(int)
 
     metrics = {
         "roc_auc": float(roc_auc_score(y_test, proba)),
         "pr_auc": float(average_precision_score(y_test, proba)),
         "confusion_matrix": confusion_matrix(y_test, pred).tolist(),
-        "classification_report": classification_report(
-            y_test, pred, output_dict=True
-        ),
+        "classification_report": classification_report(y_test, pred, output_dict=True, zero_division=0),
         "n_train": int(len(X_train)),
         "n_test": int(len(X_test)),
         "pos_rate_train": float(y_train.mean()),
         "pos_rate_test": float(y_test.mean()),
+        "threshold": thr_info,
         "ui_export_csv": str(full_out.as_posix()),
     }
 
-    # Save artifacts
     dump(calibrated, ARTIFACTS / "model.joblib")
     write_json(ARTIFACTS / "metrics.json", metrics)
+    write_json(ARTIFACTS / "threshold.json", thr_info)
 
-    # Plot
+    # Probability histogram
     plt.figure()
     plt.hist(proba, bins=30)
     plt.title("Predicted risk probability (test set)")
     plt.xlabel("p(distress)")
     plt.ylabel("count")
     plt.tight_layout()
-    fig_path = FIGURES / "probability_hist.png"
-    plt.savefig(fig_path, dpi=160)
+    plt.savefig(FIGURES / "probability_hist.png", dpi=160)
+    plt.close()
+
+    # PR curve plot (nice for recruiter-grade reports)
+    precision, recall, _ = precision_recall_curve(y_test, proba)
+    plt.figure()
+    plt.plot(recall, precision)
+    plt.title("Precision-Recall Curve")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.tight_layout()
+    plt.savefig(FIGURES / "pr_curve.png", dpi=160)
     plt.close()
 
     model_card = {
         "problem": "ASX/ABS early warning (baseline demo scaffold)",
-        "label": "target_distress_12m (placeholder rule: drawdown_12m < -0.35)",
+        "label": "target_distress_12m (noisy synthetic baseline label)",
         "notes": [
-            "This baseline uses placeholder firm features + a placeholder label rule.",
-            "Next: replace with real ASX price features and event-based labeling.",
+            "Baseline uses placeholder firm features + noisy synthetic label (non-perfect AUC by design).",
+            "Next: replace with real ASX price features + event-based labeling.",
             "ABS features can be merged by GICS industry group (or mapped industry codes).",
+            f"Recommended threshold (F1-opt): {threshold:.4f}",
             f"UI baseline export: {str(full_out.as_posix())}",
         ],
         "metrics": {k: metrics[k] for k in ["roc_auc", "pr_auc", "n_train", "n_test"]},
+        "threshold": thr_info,
     }
     write_json(ARTIFACTS / "model_card.json", model_card)
 
@@ -138,4 +184,5 @@ if __name__ == "__main__":
     m = train()
     print("Training complete. Metrics:")
     print({k: m[k] for k in ["roc_auc", "pr_auc"]})
+    print("Best threshold:", m["threshold"])
     print("Baseline CSV written to: data/processed/baseline_firm_features.csv")
