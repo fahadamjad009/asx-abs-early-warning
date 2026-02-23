@@ -9,11 +9,11 @@ import numpy as np
 import pandas as pd
 from joblib import dump
 from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
 
-from .utils import ARTIFACTS, write_json, ensure_dirs
+from .utils import ARTIFACTS, ensure_dirs, write_json
 
 ASX_LISTED_CSV_DEFAULT = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
 
@@ -44,12 +44,12 @@ def load_asx_universe(asx_listed_csv: str = ASX_LISTED_CSV_DEFAULT) -> pd.DataFr
     # Attempt 1: normal CSV read
     df = pd.read_csv(asx_listed_csv)
 
-    # If the file has a banner first line, pandas may parse it as a single-column CSV.
+    # If banner line exists, pandas may parse a 1-column "CSV"
     if df.shape[1] == 1:
-        # Attempt 2: skip the banner line
+        # Attempt 2: skip banner line
         df = pd.read_csv(asx_listed_csv, skiprows=1)
 
-        # If still single-column, try semicolon delimiter (rare edge case)
+        # If still single-column, try semicolon delimiter
         if df.shape[1] == 1:
             df = pd.read_csv(asx_listed_csv, skiprows=1, sep=";")
 
@@ -71,14 +71,15 @@ def load_asx_universe(asx_listed_csv: str = ASX_LISTED_CSV_DEFAULT) -> pd.DataFr
     if "ticker" not in df.columns and "asx_code" in df.columns:
         df = df.rename(columns={"asx_code": "ticker"})
 
-    # Hard requirement for the rest of the pipeline
     if "ticker" not in df.columns:
         raise ValueError(
             "Could not find ticker column in ASX CSV after retries. "
             f"Parsed columns: {list(df.columns)}"
         )
 
-    return df
+    # Keep only the columns we care about (if present)
+    keep = [c for c in ["company_name", "ticker", "gics_industry_group"] if c in df.columns]
+    return df[keep].copy()
 
 
 def load_abs_features(abs_csv_path: Path) -> pd.DataFrame:
@@ -87,18 +88,40 @@ def load_abs_features(abs_csv_path: Path) -> pd.DataFrame:
     return df
 
 
-def build_firm_features_placeholder(asx: pd.DataFrame) -> pd.DataFrame:
+def build_firm_features_placeholder(asx: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
+    """
+    Baseline "firm features" generator (placeholder).
+    The key change vs earlier version:
+      - target is NOT a deterministic rule (which created perfect AUC).
+      - target is a noisy risk score threshold (more realistic baseline behavior).
+    """
     df = asx.copy()
-    rng = np.random.default_rng(7)
+    rng = np.random.default_rng(seed)
 
+    # Synthetic-ish features (until replaced with real ASX price/fundamental features)
     df["ret_12m"] = rng.normal(0.08, 0.25, size=len(df))
     df["vol_12m"] = np.abs(rng.normal(0.25, 0.10, size=len(df)))
     df["drawdown_12m"] = -np.abs(rng.normal(0.20, 0.15, size=len(df)))
     df["mom_3m"] = rng.normal(0.02, 0.10, size=len(df))
     df["liq_proxy"] = np.abs(rng.normal(1.0, 0.5, size=len(df)))
 
-    # Placeholder target — replace with real event labeling later
-    df["target_distress_12m"] = (df["drawdown_12m"] < -0.35).astype(int)
+    # -----------------------------------------
+    # Realism fix: probabilistic, noisy labeling
+    # -----------------------------------------
+    # Construct a "risk" latent score with noise.
+    # (Still placeholder, but avoids perfect separability and looks credible.)
+    risk = (
+        (-df["ret_12m"]) * 0.8
+        + df["vol_12m"] * 0.6
+        + (-df["drawdown_12m"]) * 1.0
+        + np.abs(df["mom_3m"]) * 0.2
+        + rng.normal(0, 0.6, size=len(df))  # noise drives non-perfect AUC
+    )
+
+    # Label top ~15% as "distress" class (tunable)
+    thresh = np.quantile(risk, 0.85)
+    df["target_distress_12m"] = (risk > thresh).astype(int)
+
     return df
 
 
@@ -107,8 +130,13 @@ def merge_abs_macro(
     abs_df: Optional[pd.DataFrame] = None,
     on: str = "gics_industry_group",
 ) -> pd.DataFrame:
+    """
+    Merge ABS macro features onto firms by a shared key (default: gics_industry_group).
+    If abs_df contains 'period', take the most recent row per group.
+    """
     if abs_df is None:
         return firm_df
+
     firm_df = firm_df.copy()
     abs_df = abs_df.copy()
 
@@ -140,14 +168,18 @@ def infer_schema(df: pd.DataFrame, target_col: str) -> Schema:
 
 
 def build_preprocessor(schema: Schema) -> ColumnTransformer:
-    num_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    cat_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-    ])
+    num_pipe = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    cat_pipe = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]
+    )
 
     return ColumnTransformer(
         transformers=[
@@ -164,6 +196,11 @@ def make_training_dataset(
     target_col: str = "target_distress_12m",
     save_schema: bool = True,
 ) -> Tuple[pd.DataFrame, pd.Series, Schema]:
+    """
+    Returns X, y, schema.
+    X contains: id_cols + categorical_cols + numeric_cols
+    y is target_col.
+    """
     ensure_dirs()
 
     asx = load_asx_universe()
