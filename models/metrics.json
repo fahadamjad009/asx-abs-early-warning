@@ -1,0 +1,33 @@
+{
+  "trained_at_utc": "2026-02-24T14:28:23Z",
+  "data_path": ".\\data\\processed\\market_firm_features.csv",
+  "rows": 170,
+  "features": 5,
+  "label_col": "target_distress_12m",
+  "id_cols_dropped": [
+    "ticker"
+  ],
+  "test_size": 0.2,
+  "random_state": 42,
+  "roc_auc": 1.0,
+  "avg_precision": 1.0,
+  "best_threshold": 0.8267121917602429,
+  "threshold_details": {
+    "best_index": 5,
+    "best_f1": 0.9999999999995,
+    "best_precision": 1.0,
+    "best_recall": 1.0
+  },
+  "confusion_matrix": [
+    [
+      15,
+      0
+    ],
+    [
+      0,
+      19
+    ]
+  ],
+  "pos_rate_overall": 0.5705882352941176,
+  "pos_rate_test": 0.5588235294117647
+}

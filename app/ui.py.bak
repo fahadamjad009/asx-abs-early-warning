@@ -7,55 +7,23 @@ import requests
 import streamlit as st
 
 API_URL_DEFAULT = "http://127.0.0.1:8000"
-
-# UPDATED: prefer real market dataset output; fall back to baseline if present
-MARKET_CSV = Path("data/processed/market_firm_features.csv")
 BASELINE_CSV = Path("data/processed/baseline_firm_features.csv")
 
 st.set_page_config(page_title="ASX/ABS Early Warning", layout="wide")
-st.title("ASX/ABS Early Warning — Risk Scoring Dashboard")
+st.title("ASX/ABS Early Warning — Risk Scoring Dashboard (Baseline)")
 
 api_url = st.sidebar.text_input("API URL", value=API_URL_DEFAULT)
 
 # -----------------------------
-# Show active threshold from API (single source of truth)
+# Load baseline dataset (if available)
 # -----------------------------
-active_threshold = None
-try:
-    h = requests.get(f"{api_url}/", timeout=10)
-    if h.ok:
-        j = h.json()
-        active_threshold = j.get("threshold")
-except Exception:
-    active_threshold = None
-
-if active_threshold is not None:
-    st.caption(f"Using calibrated threshold (from API): **{float(active_threshold):.4f}**")
-else:
-    st.caption("Threshold: unavailable (API not reachable).")
-
-# -----------------------------
-# Load dataset for autofill + top-risk scoring
-# -----------------------------
-data_df: pd.DataFrame | None = None
-data_source = None
-
-if MARKET_CSV.exists():
-    data_df = pd.read_csv(MARKET_CSV)
-    data_source = str(MARKET_CSV)
-elif BASELINE_CSV.exists():
-    data_df = pd.read_csv(BASELINE_CSV)
-    data_source = str(BASELINE_CSV)
-
-st.sidebar.markdown("### Data source")
-if data_source:
-    st.sidebar.success(f"Loaded: {data_source}")
-else:
-    st.sidebar.warning("No local dataset found. Train/build dataset to enable autofill + top-risk table.")
+baseline_df: pd.DataFrame | None = None
+if BASELINE_CSV.exists():
+    baseline_df = pd.read_csv(BASELINE_CSV)
 
 st.header("Single company scoring")
 
-# Defaults (overridden by autofill if dataset exists)
+# Defaults (overridden by autofill if baseline CSV exists)
 default_ticker = "CBA"
 default_gics = "Banks"
 default_ret = 0.10
@@ -64,23 +32,17 @@ default_dd = -0.20
 default_mom = 0.02
 default_liq = 1.0
 
-ticker_selected = None
-if data_df is not None and "ticker" in data_df.columns:
-    st.caption("Auto-fill enabled (loaded local dataset).")
+if baseline_df is not None:
+    st.caption("Auto-fill enabled (loaded baseline dataset from training).")
 
-    ticker_list = data_df["ticker"].dropna().astype(str).unique().tolist()
+    ticker_list = baseline_df["ticker"].dropna().astype(str).unique().tolist()
     ticker_selected = st.selectbox("Pick a ticker", options=sorted(ticker_list), index=0)
 
-    row = data_df.loc[data_df["ticker"].astype(str) == str(ticker_selected)].iloc[0]
+    row = baseline_df.loc[baseline_df["ticker"].astype(str) == str(ticker_selected)].iloc[0]
 
     default_ticker = str(row.get("ticker", default_ticker))
-
-    # keep gics optional, but only if present
-    if "gics_industry_group" in data_df.columns:
-        gics_val = row.get("gics_industry_group", "")
-        default_gics = "" if pd.isna(gics_val) else str(gics_val)
-    else:
-        default_gics = ""
+    gics_val = row.get("gics_industry_group", "")
+    default_gics = "" if pd.isna(gics_val) else str(gics_val)
 
     default_ret = float(row.get("ret_12m", default_ret))
     default_vol = float(row.get("vol_12m", default_vol))
@@ -88,19 +50,19 @@ if data_df is not None and "ticker" in data_df.columns:
     default_mom = float(row.get("mom_3m", default_mom))
     default_liq = float(row.get("liq_proxy", default_liq))
 else:
-    st.caption("Auto-fill disabled (no dataset found).")
+    st.caption("Auto-fill disabled (run: python -m src.train to generate baseline CSV).")
 
 c1, c2, c3 = st.columns(3)
 with c1:
     ticker = st.text_input("Ticker", value=default_ticker)
     gics = st.text_input("GICS industry group (optional)", value=default_gics)
 with c2:
-    ret_12m = st.number_input("Return 12m", value=float(default_ret))
-    vol_12m = st.number_input("Volatility 12m", value=float(default_vol))
+    ret_12m = st.number_input("Return 12m", value=default_ret)
+    vol_12m = st.number_input("Volatility 12m", value=default_vol)
 with c3:
-    drawdown_12m = st.number_input("Drawdown 12m", value=float(default_dd))
-    mom_3m = st.number_input("Momentum 3m", value=float(default_mom))
-    liq_proxy = st.number_input("Liquidity proxy", value=float(default_liq))
+    drawdown_12m = st.number_input("Drawdown 12m", value=default_dd)
+    mom_3m = st.number_input("Momentum 3m", value=default_mom)
+    liq_proxy = st.number_input("Liquidity proxy", value=default_liq)
 
 if st.button("Score"):
     payload = {
@@ -115,12 +77,8 @@ if st.button("Score"):
     r = requests.post(f"{api_url}/predict", json=payload, timeout=30)
     r.raise_for_status()
     out = r.json()
-
     st.metric("Risk probability", f"{out['probability']:.3f}")
-
-    thr = out.get("threshold", active_threshold if active_threshold is not None else 0.5)
-    st.metric(f"Prediction (>= {float(thr):.3f})", out["prediction"])
-
+    st.metric("Prediction (>=0.5)", out["prediction"])
     st.caption(f"API version: {out.get('api_version', 'n/a')}")
 
 st.divider()
@@ -128,26 +86,21 @@ st.divider()
 # -----------------------------
 # Top risk list (FAST via /predict_batch)
 # -----------------------------
-st.header("Top risk companies (scored from local dataset)")
-if data_df is None:
-    st.info(
-        "No local dataset found. Generate one:\n"
-        "- Real market: python -c \"from src.build_dataset import build_market_dataset; build_market_dataset(limit=200, force=False)\"\n"
-        "- Then train: python -m src.train --data .\\data\\processed\\market_firm_features.csv --out .\\models"
-    )
+st.header("Top risk companies (scored from baseline dataset)")
+if baseline_df is None:
+    st.info("Run training to generate data/processed/baseline_firm_features.csv, then refresh this page.")
 else:
     n = st.slider("How many rows to score", min_value=20, max_value=300, value=80, step=20)
 
-    sample = data_df.head(n).copy()
+    sample = baseline_df.head(n).copy()
 
-    # Build batch rows
     batch_rows = []
     for _, r0 in sample.iterrows():
         batch_rows.append(
             {
                 "ticker": str(r0.get("ticker", "")),
                 "gics_industry_group": None
-                if ("gics_industry_group" not in sample.columns) or pd.isna(r0.get("gics_industry_group"))
+                if pd.isna(r0.get("gics_industry_group"))
                 else str(r0.get("gics_industry_group")),
                 "ret_12m": float(r0.get("ret_12m", 0.0)),
                 "vol_12m": float(r0.get("vol_12m", 0.0)),
@@ -164,13 +117,7 @@ else:
             timeout=60,
         )
         rr.raise_for_status()
-
-        # IMPORTANT: your API currently returns a list (backward compatible)
-        data = rr.json()
-        scored = pd.DataFrame(data)
-
-    if "probability" in scored.columns:
-        scored = scored.sort_values("probability", ascending=False)
+        scored = pd.DataFrame(rr.json()).sort_values("probability", ascending=False)
 
     st.dataframe(scored.head(25), use_container_width=True)
 
@@ -191,6 +138,7 @@ if up is not None:
     st.write("Preview", df.head(10))
 
     if st.button("Score batch"):
+        # Build batch rows
         rows = []
         for _, r0 in df.iterrows():
             rows.append(

@@ -9,15 +9,36 @@ from pydantic import BaseModel, Field
 
 from src.utils import ARTIFACTS, read_json
 
+# NEW: use metrics.json from the real-data training run (models/)
+from src.model_io import get_threshold, load_artifacts
+
 app = FastAPI(title="ASX/ABS Early Warning API", version="0.1.0")
 
-# Load artifacts (created by: python -m src.train)
-SCHEMA = read_json(ARTIFACTS / "schema.json")
-MODEL = load(ARTIFACTS / "model.joblib")
+# -----------------------------
+# Load artifacts (backward compatible)
+# -----------------------------
 
-# Load recommended threshold (created by: python -m src.train)
-THRESH = read_json(ARTIFACTS / "threshold.json") if (ARTIFACTS / "threshold.json").exists() else None
-DEFAULT_THRESHOLD = float(THRESH["threshold"]) if THRESH and "threshold" in THRESH else 0.5
+# Keep your existing schema loading (so UI/docs still show "schema_loaded")
+SCHEMA = read_json(ARTIFACTS / "schema.json") if (ARTIFACTS / "schema.json").exists() else {}
+
+# Prefer NEW real-data artifacts in ./models (created by python -m src.train)
+# Fallback to old ARTIFACTS/model.joblib if needed
+try:
+    MODEL, METRICS = load_artifacts()  # loads models/model.joblib + models/metrics.json
+except Exception:
+    MODEL = load(ARTIFACTS / "model.joblib")  # old path fallback
+    METRICS = {}
+
+# Prefer threshold from metrics.json; fallback to old artifacts/threshold.json; else 0.5
+DEFAULT_THRESHOLD = get_threshold(METRICS, default=0.5)
+
+if DEFAULT_THRESHOLD == 0.5 and (ARTIFACTS / "threshold.json").exists():
+    try:
+        THRESH = read_json(ARTIFACTS / "threshold.json")
+        if isinstance(THRESH, dict) and "threshold" in THRESH:
+            DEFAULT_THRESHOLD = float(THRESH["threshold"])
+    except Exception:
+        pass
 
 
 class PredictRequest(BaseModel):
@@ -52,13 +73,14 @@ def root() -> Dict[str, Any]:
         "predict": "/predict",
         "predict_batch": "/predict_batch",
         "schema_loaded": bool(SCHEMA),
-        "threshold": DEFAULT_THRESHOLD,
+        "threshold": float(DEFAULT_THRESHOLD),
     }
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"status": "ok"}
+    # Include threshold so you can verify it’s using metrics.json in one call
+    return {"status": "ok", "threshold": float(DEFAULT_THRESHOLD)}
 
 
 @app.post("/predict", response_model=PredictResponse)
@@ -70,7 +92,7 @@ def predict(req: PredictRequest) -> PredictResponse:
         ticker=req.ticker,
         probability=proba,
         prediction=pred,
-        threshold=DEFAULT_THRESHOLD,
+        threshold=float(DEFAULT_THRESHOLD),
     )
 
 
