@@ -1,4 +1,4 @@
-\# ASX/ABS Early Warning Platform
+# ASX/ABS Early Warning Platform
 
 
 
@@ -10,11 +10,11 @@ A production-style financial risk analytics prototype that combines ASX market s
 
 
 
-\---
+---
 
 
 
-\## Why this project matters
+## Why this project matters
 
 
 
@@ -26,27 +26,27 @@ This project is designed as a portfolio-grade system, not just a notebook. It in
 
 
 
-\- data ingestion and feature generation
+- data ingestion and feature generation
 
-\- trained ML artifacts
+- trained ML artifacts
 
-\- FastAPI prediction endpoints
+- FastAPI prediction endpoints
 
-\- Streamlit dashboard
+- Streamlit dashboard
 
-\- model metrics and figures
+- model metrics and figures
 
-\- reproducible local setup
+- reproducible local setup
 
-\- clear limitations and roadmap
-
-
-
-\---
+- clear limitations and roadmap
 
 
 
-\## Current capability
+---
+
+
+
+## Current capability
 
 
 
@@ -54,29 +54,29 @@ The current implementation can:
 
 
 
-\- load processed ASX market feature data
+- load processed ASX market feature data
 
-\- score a single company through a FastAPI endpoint
+- score a single company through a FastAPI endpoint
 
-\- score batches of tickers through `/predict\_batch`
+- score batches of tickers through `/predict_batch`
 
-\- display a Streamlit risk-scoring dashboard
+- display a Streamlit risk-scoring dashboard
 
-\- show model threshold and risk probabilities
+- show model threshold and risk probabilities
 
-\- use cached Yahoo Finance market data
+- use cached Yahoo Finance market data
 
-\- load trained model artifacts from `models/` or fallback artifacts from `artifacts/`
+- load trained model artifacts from `models/` or fallback artifacts from `artifacts/`
 
-\- surface baseline evaluation outputs and model cards
-
-
-
-\---
+- surface baseline evaluation outputs and model cards
 
 
 
-\## Architecture
+---
+
+
+
+## Architecture
 
 
 
@@ -84,59 +84,59 @@ The current implementation can:
 
 ASX / Yahoo Finance data
 
-&#x20;       |
+        |
 
-&#x20;       v
+        v
 
 data/cache/yahoo/\*.parquet
 
-&#x20;       |
+        |
 
-&#x20;       v
+        v
 
-src/market\_data.py
+src/market_data.py
 
-src/price\_features.py
+src/price_features.py
 
-src/build\_dataset.py
+src/build_dataset.py
 
-&#x20;       |
+        |
 
-&#x20;       v
+        v
 
-data/processed/market\_firm\_features.csv
+data/processed/market_firm_features.csv
 
-&#x20;       |
+        |
 
-&#x20;       v
+        v
 
 src/train.py
 
-&#x20;       |
+        |
 
-&#x20;       v
+        v
 
 models/model.joblib
 
 models/metrics.json
 
-&#x20;       |
+        |
 
-&#x20;       +-----------------------------+
+        +-----------------------------+
 
-&#x20;       |                             |
+        |                             |
 
-&#x20;       v                             v
+        v                             v
 
 FastAPI scoring service          Streamlit dashboard
 
 app/api.py                       app/ui.py
 
-&#x20;       |                             |
+        |                             |
 
-&#x20;       v                             v
+        v                             v
 
-/predict, /predict\_batch          single company scoring
+/predict, /predict_batch          single company scoring
 
 /health, /docs                    top-risk exploration
 
