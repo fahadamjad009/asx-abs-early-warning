@@ -1,530 +1,297 @@
+"""ASX/ABS Early Warning — Self-contained Streamlit Dashboard."""
 from __future__ import annotations
-
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
-
-# Plotly (interactive charts)
 import plotly.express as px
 import plotly.graph_objects as go
+from joblib import load
 
-API_URL_DEFAULT = "http://127.0.0.1:8000"
+# ── Paths ──
+MODEL_PATH = Path("models/model.joblib")
+METRICS_PATH = Path("models/metrics.json")
+DATA_PATH = Path("data/processed/market_firm_features.csv")
 
-# Prefer real market dataset output; fall back to baseline if present
-MARKET_CSV = Path("data/processed/market_firm_features.csv")
-BASELINE_CSV = Path("data/processed/baseline_firm_features.csv")
+# ── Load artifacts ──
+@st.cache_resource
+def load_model():
+    return load(MODEL_PATH)
 
+@st.cache_data
+def load_metrics():
+    if METRICS_PATH.exists():
+        with open(METRICS_PATH) as f:
+            return json.load(f)
+    return {}
 
-# -----------------------------
-# Helpers (HTTP + payload shaping)
-# -----------------------------
-def _safe_get_json(url: str, timeout: int = 10) -> Optional[dict]:
-    try:
-        r = requests.get(url, timeout=timeout)
-        if not r.ok:
-            return None
-        return r.json()
-    except Exception:
-        return None
+@st.cache_data
+def load_data():
+    if DATA_PATH.exists():
+        return pd.read_csv(DATA_PATH)
+    return None
 
+FEATURE_COLS = ["ret_12m", "vol_12m", "drawdown_12m", "mom_3m", "liq_proxy"]
+PREDICT_COLS = ["ticker", "gics_industry_group"] + FEATURE_COLS
 
-def _build_rows_from_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for _, r0 in df.iterrows():
-        rows.append(
-            {
-                "ticker": str(r0.get("ticker", "")),
-                "gics_industry_group": None
-                if ("gics_industry_group" not in df.columns) or pd.isna(r0.get("gics_industry_group"))
-                else str(r0.get("gics_industry_group")),
-                "ret_12m": float(r0.get("ret_12m", 0.0)),
-                "vol_12m": float(r0.get("vol_12m", 0.0)),
-                "drawdown_12m": float(r0.get("drawdown_12m", 0.0)),
-                "mom_3m": float(r0.get("mom_3m", 0.0)),
-                "liq_proxy": float(r0.get("liq_proxy", 0.0)),
-            }
-        )
-    return rows
+def predict_df(model, df, threshold):
+    pred_df = df[PREDICT_COLS].copy()
+    probas = model.predict_proba(pred_df)[:, 1]
+    preds = (probas >= threshold).astype(int)
+    result = df.copy()
+    result["probability"] = probas
+    result["prediction"] = preds
+    result["risk_level"] = pd.cut(probas, bins=[0, 0.3, 0.6, 0.85, 1.0],
+                                   labels=["Low", "Medium", "High", "Critical"])
+    return result.sort_values("probability", ascending=False)
 
+# ── Page config ──
+st.set_page_config(page_title="ASX/ABS Early Warning", page_icon="📊", layout="wide")
 
-def _post_predict_batch(api_url: str, rows: List[Dict[str, Any]], timeout: int = 120) -> pd.DataFrame:
-    rr = requests.post(f"{api_url}/predict_batch", json={"rows": rows}, timeout=timeout)
-    rr.raise_for_status()
-    data = rr.json()  # API returns a list of dicts
-    return pd.DataFrame(data)
+# ── Load everything ──
+model = load_model()
+metrics = load_metrics()
+data = load_data()
+threshold = float(metrics.get("best_threshold", 0.5))
 
+# ══════════════════════════════════════════
+# HEADER
+# ══════════════════════════════════════════
+st.markdown("# 📊 ASX/ABS Early Warning — Risk Scoring Platform")
+st.caption("Production-style financial risk analytics combining ASX market signals with macroeconomic context.")
 
-def _predict_batch_chunked(
-    api_url: str,
-    rows: List[Dict[str, Any]],
-    chunk_size: int = 50,
-    timeout: int = 120,
-) -> pd.DataFrame:
-    """
-    Chunk /predict_batch calls to avoid connection resets on reruns or large payloads.
-    """
-    out_frames: List[pd.DataFrame] = []
-    total = len(rows)
-    for start in range(0, total, chunk_size):
-        chunk = rows[start : start + chunk_size]
-        df_chunk = _post_predict_batch(api_url, chunk, timeout=timeout)
-        out_frames.append(df_chunk)
-    if not out_frames:
-        return pd.DataFrame()
-    return pd.concat(out_frames, ignore_index=True)
+# ── Hero metrics ──
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Companies", len(data) if data is not None else 0)
+m2.metric("Calibrated Threshold", f"{threshold:.4f}")
+m3.metric("ROC AUC", f"{metrics.get('roc_auc', 'n/a')}")
+m4.metric("Avg Precision", f"{metrics.get('avg_precision', 'n/a')}")
+m5.metric("Model", "Stacked Ensemble")
 
+st.divider()
 
-# -----------------------------
-# Plotly chart helpers (interactive, responsive)
-# -----------------------------
-def _plot_confusion_matrix(cm: np.ndarray, title: str) -> None:
-    z = np.array(cm, dtype=int)
-    fig = px.imshow(
-        z,
-        text_auto=True,
-        x=["Pred 0", "Pred 1"],
-        y=["True 0", "True 1"],
-        aspect="auto",
-        title=title,
-    )
-    fig.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=320)
-    st.plotly_chart(fig, use_container_width=True)
+if data is None:
+    st.error("No dataset found at data/processed/market_firm_features.csv")
+    st.stop()
 
+# ══════════════════════════════════════════
+# SCORE ALL COMPANIES
+# ══════════════════════════════════════════
+scored = predict_df(model, data, threshold)
 
-def _plot_probability_histogram(prob: np.ndarray, thr: float, title: str) -> None:
-    dfp = pd.DataFrame({"probability": prob})
-    fig = px.histogram(
-        dfp,
-        x="probability",
-        nbins=40,
-        title=title,
-        marginal="box",
-    )
-    fig.add_vline(
-        x=float(thr),
-        line_dash="dash",
-        annotation_text=f"thr={float(thr):.3f}",
-        annotation_position="top right",
-    )
-    fig.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=380)
-    st.plotly_chart(fig, use_container_width=True)
+# ══════════════════════════════════════════
+# TAB LAYOUT
+# ══════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🏠 Risk Overview", "🔍 Company Lookup", "📈 Market Analysis",
+    "🧪 Model Evaluation", "📋 Full Dataset"
+])
 
+# ── TAB 1: RISK OVERVIEW ──
+with tab1:
+    st.header("Risk Overview")
 
-def _plot_roc_curve(fpr: np.ndarray, tpr: np.ndarray, auc: float, title: str) -> None:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
-    fig.add_trace(
-        go.Scatter(
-            x=[0, 1],
-            y=[0, 1],
-            mode="lines",
-            name="Chance",
-            line=dict(dash="dash"),
-        )
-    )
-    fig.update_layout(
-        title=title,
-        xaxis_title="False Positive Rate",
-        yaxis_title="True Positive Rate",
-        margin=dict(l=20, r=20, t=60, b=20),
-        height=380,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # Top risk companies
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        st.subheader("Top 15 Highest-Risk Companies")
+        top = scored.head(15)[["ticker", "gics_industry_group", "probability", "risk_level",
+                                "ret_12m", "drawdown_12m", "vol_12m"]].reset_index(drop=True)
+        st.dataframe(top, use_container_width=True, height=400)
 
+    with col_b:
+        st.subheader("Risk Distribution")
+        risk_counts = scored["risk_level"].value_counts()
+        fig_pie = px.pie(values=risk_counts.values, names=risk_counts.index,
+                         color=risk_counts.index,
+                         color_discrete_map={"Low": "#2ecc71", "Medium": "#f39c12",
+                                             "High": "#e74c3c", "Critical": "#8e44ad"},
+                         hole=0.4)
+        fig_pie.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=400)
+        st.plotly_chart(fig_pie, use_container_width=True)
 
-def _plot_pr_curve(recall: np.ndarray, precision: np.ndarray, ap: float, title: str) -> None:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=recall, y=precision, mode="lines", name=f"PR (AP={ap:.3f})"))
-    fig.update_layout(
-        title=title,
-        xaxis_title="Recall",
-        yaxis_title="Precision",
-        margin=dict(l=20, r=20, t=60, b=20),
-        height=380,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # Sector risk heatmap
+    st.subheader("Sector Risk Heatmap")
+    sector_stats = scored.groupby("gics_industry_group").agg(
+        avg_risk=("probability", "mean"),
+        max_risk=("probability", "max"),
+        count=("ticker", "count"),
+        avg_drawdown=("drawdown_12m", "mean"),
+    ).sort_values("avg_risk", ascending=False).reset_index()
 
+    fig_hm = px.bar(sector_stats, x="gics_industry_group", y="avg_risk",
+                    color="avg_risk", color_continuous_scale="RdYlGn_r",
+                    hover_data=["max_risk", "count", "avg_drawdown"],
+                    title="Average Risk Score by GICS Sector")
+    fig_hm.update_layout(xaxis_title="Sector", yaxis_title="Avg Risk Probability",
+                         margin=dict(l=20, r=20, t=60, b=80), height=400)
+    st.plotly_chart(fig_hm, use_container_width=True)
 
-def _plot_feature_scatter(sample: pd.DataFrame, y_true: np.ndarray, y_score: np.ndarray) -> None:
-    """
-    Quick EDA-style chart: drawdown vs vol, colored by true label, sized by probability.
-    """
-    dfp = sample.copy()
-    dfp["_y_true"] = y_true
-    dfp["_prob"] = y_score
-    # Guard in case columns missing
-    if ("drawdown_12m" not in dfp.columns) or ("vol_12m" not in dfp.columns):
-        return
+    # Probability distribution
+    st.subheader("Risk Score Distribution")
+    fig_hist = px.histogram(scored, x="probability", nbins=30, marginal="box",
+                            color_discrete_sequence=["#3498db"],
+                            title="Distribution of Risk Probabilities Across All Companies")
+    fig_hist.add_vline(x=threshold, line_dash="dash", line_color="red",
+                       annotation_text=f"Threshold: {threshold:.3f}")
+    fig_hist.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=380)
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-    fig = px.scatter(
-        dfp,
-        x="drawdown_12m",
-        y="vol_12m",
-        color=dfp["_y_true"].astype(str),
-        size=np.clip(dfp["_prob"], 0.01, 1.0),
-        hover_data=["ticker", "_prob", "ret_12m", "mom_3m", "liq_proxy"],
-        title="Data explorer: drawdown_12m vs vol_12m (color=true label, size=pred prob)",
-    )
-    fig.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=420)
-    st.plotly_chart(fig, use_container_width=True)
+# ── TAB 2: COMPANY LOOKUP ──
+with tab2:
+    st.header("Single Company Risk Scoring")
+    tickers = sorted(scored["ticker"].unique().tolist())
+    selected = st.selectbox("Select a company", tickers)
 
+    row = scored[scored["ticker"] == selected].iloc[0]
 
-# -----------------------------
-# Page setup
-# -----------------------------
-st.set_page_config(page_title="ASX/ABS Early Warning", layout="wide")
-st.title("ASX/ABS Early Warning — Risk Scoring Dashboard")
+    lc1, lc2, lc3, lc4 = st.columns(4)
+    lc1.metric("Risk Probability", f"{row['probability']:.4f}")
+    lc2.metric("Risk Level", row["risk_level"])
+    lc3.metric("Prediction", "⚠️ DISTRESS" if row["prediction"] == 1 else "✅ HEALTHY")
+    lc4.metric("Sector", row["gics_industry_group"])
 
-api_url = st.sidebar.text_input("API URL", value=API_URL_DEFAULT)
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    fc1.metric("Return 12m", f"{row['ret_12m']:.2%}")
+    fc2.metric("Volatility 12m", f"{row['vol_12m']:.4f}")
+    fc3.metric("Drawdown 12m", f"{row['drawdown_12m']:.2%}")
+    fc4.metric("Momentum 3m", f"{row['mom_3m']:.2%}")
+    fc5.metric("Liquidity", f"{row['liq_proxy']:.4f}")
 
-# -----------------------------
-# Show active threshold from API (single source of truth)
-# -----------------------------
-root = _safe_get_json(f"{api_url}/", timeout=10)
-active_threshold = None
-if isinstance(root, dict):
-    active_threshold = root.get("threshold")
+    # Peer comparison
+    st.subheader("Peer Comparison (Same Sector)")
+    peers = scored[scored["gics_industry_group"] == row["gics_industry_group"]]
+    fig_peer = px.bar(peers.sort_values("probability", ascending=False),
+                      x="ticker", y="probability",
+                      color="probability", color_continuous_scale="RdYlGn_r",
+                      title=f"Risk Scores: {row['gics_industry_group']} Sector")
+    fig_peer.add_hline(y=threshold, line_dash="dash", line_color="red")
+    fig_peer.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=380)
+    st.plotly_chart(fig_peer, use_container_width=True)
 
-if active_threshold is not None:
-    st.caption(f"Using calibrated threshold (from API): **{float(active_threshold):.4f}**")
-else:
-    st.caption("Threshold: unavailable (API not reachable).")
+    # Manual scoring
+    st.subheader("Custom Input Scoring")
+    with st.expander("Enter custom values"):
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            c_ticker = st.text_input("Ticker", value="CUSTOM")
+            c_gics = st.text_input("GICS Group", value="Other")
+        with cc2:
+            c_ret = st.number_input("Return 12m", value=0.0, format="%.4f")
+            c_vol = st.number_input("Volatility 12m", value=0.25, format="%.4f")
+            c_dd = st.number_input("Drawdown 12m", value=-0.20, format="%.4f")
+        with cc3:
+            c_mom = st.number_input("Momentum 3m", value=0.0, format="%.4f")
+            c_liq = st.number_input("Liquidity proxy", value=1.0, format="%.4f")
 
-# -----------------------------
-# Load dataset for autofill + top-risk scoring
-# -----------------------------
-data_df: pd.DataFrame | None = None
-data_source = None
+        if st.button("Score Custom Input"):
+            custom = pd.DataFrame([{
+                "ticker": c_ticker, "gics_industry_group": c_gics,
+                "ret_12m": c_ret, "vol_12m": c_vol, "drawdown_12m": c_dd,
+                "mom_3m": c_mom, "liq_proxy": c_liq,
+            }])
+            proba = float(model.predict_proba(custom[PREDICT_COLS])[:, 1][0])
+            pred = int(proba >= threshold)
+            st.metric("Risk Probability", f"{proba:.4f}")
+            st.metric("Prediction", "⚠️ DISTRESS" if pred == 1 else "✅ HEALTHY")
 
-if MARKET_CSV.exists():
-    data_df = pd.read_csv(MARKET_CSV)
-    data_source = str(MARKET_CSV)
-elif BASELINE_CSV.exists():
-    data_df = pd.read_csv(BASELINE_CSV)
-    data_source = str(BASELINE_CSV)
+# ── TAB 3: MARKET ANALYSIS ──
+with tab3:
+    st.header("Market-Wide Analysis")
 
-st.sidebar.markdown("### Data source")
-if data_source:
-    st.sidebar.success(f"Loaded:\n{data_source}")
-else:
-    st.sidebar.warning("No local dataset found. Train/build dataset to enable autofill + top-risk table.")
+    # Scatter: Return vs Drawdown
+    st.subheader("Return vs Drawdown (bubble = risk probability)")
+    fig_sc = px.scatter(scored, x="drawdown_12m", y="ret_12m",
+                        size=np.clip(scored["probability"], 0.05, 1.0),
+                        color="risk_level",
+                        color_discrete_map={"Low": "#2ecc71", "Medium": "#f39c12",
+                                            "High": "#e74c3c", "Critical": "#8e44ad"},
+                        hover_data=["ticker", "probability", "gics_industry_group", "vol_12m"],
+                        title="Return vs Drawdown — Risk-Sized Scatter")
+    fig_sc.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=500)
+    st.plotly_chart(fig_sc, use_container_width=True)
 
-# -----------------------------
-# Single company scoring
-# -----------------------------
-st.header("Single company scoring")
+    # Volatility vs Momentum
+    st.subheader("Volatility vs Momentum")
+    fig_vm = px.scatter(scored, x="vol_12m", y="mom_3m",
+                        color="probability", color_continuous_scale="RdYlGn_r",
+                        hover_data=["ticker", "gics_industry_group", "drawdown_12m"],
+                        title="Volatility vs Momentum — Color = Risk Score")
+    fig_vm.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=450)
+    st.plotly_chart(fig_vm, use_container_width=True)
 
-default_ticker = "CBA"
-default_gics = "Banks"
-default_ret = 0.10
-default_vol = 0.25
-default_dd = -0.20
-default_mom = 0.02
-default_liq = 1.0
+    # Feature correlation
+    st.subheader("Feature Correlation Matrix")
+    corr = scored[FEATURE_COLS + ["probability"]].corr()
+    fig_corr = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r",
+                         title="Feature Correlation Heatmap")
+    fig_corr.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=450)
+    st.plotly_chart(fig_corr, use_container_width=True)
 
-if data_df is not None and "ticker" in data_df.columns:
-    st.caption("Auto-fill enabled (loaded local dataset).")
+# ── TAB 4: MODEL EVALUATION ──
+with tab4:
+    st.header("Model Evaluation")
 
-    ticker_list = data_df["ticker"].dropna().astype(str).unique().tolist()
-    ticker_selected = st.selectbox("Pick a ticker", options=sorted(ticker_list), index=0)
-
-    row = data_df.loc[data_df["ticker"].astype(str) == str(ticker_selected)].iloc[0]
-
-    default_ticker = str(row.get("ticker", default_ticker))
-
-    if "gics_industry_group" in data_df.columns:
-        gics_val = row.get("gics_industry_group", "")
-        default_gics = "" if pd.isna(gics_val) else str(gics_val)
+    if "target_distress_12m" not in scored.columns:
+        st.warning("No target column (target_distress_12m) in dataset — evaluation metrics unavailable.")
+        st.info("Training metrics from models/metrics.json are shown in the header.")
     else:
-        default_gics = ""
+        from sklearn.metrics import (confusion_matrix, roc_auc_score, roc_curve,
+                                     precision_recall_curve, average_precision_score,
+                                     classification_report)
 
-    default_ret = float(row.get("ret_12m", default_ret))
-    default_vol = float(row.get("vol_12m", default_vol))
-    default_dd = float(row.get("drawdown_12m", default_dd))
-    default_mom = float(row.get("mom_3m", default_mom))
-    default_liq = float(row.get("liq_proxy", default_liq))
-else:
-    st.caption("Auto-fill disabled (no dataset found).")
+        y_true = scored["target_distress_12m"].astype(int).values
+        y_score = scored["probability"].values
+        y_pred = scored["prediction"].values
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    ticker = st.text_input("Ticker", value=default_ticker)
-    gics = st.text_input("GICS industry group (optional)", value=default_gics)
-with c2:
-    ret_12m = st.number_input("Return 12m", value=float(default_ret))
-    vol_12m = st.number_input("Volatility 12m", value=float(default_vol))
-with c3:
-    drawdown_12m = st.number_input("Drawdown 12m", value=float(default_dd))
-    mom_3m = st.number_input("Momentum 3m", value=float(default_mom))
-    liq_proxy = st.number_input("Liquidity proxy", value=float(default_liq))
+        ev1, ev2, ev3, ev4 = st.columns(4)
+        ev1.metric("Total Samples", len(y_true))
+        ev2.metric("Positive Rate", f"{y_true.mean():.3f}")
 
-if st.button("Score"):
-    payload = {
-        "ticker": ticker,
-        "gics_industry_group": gics if gics.strip() else None,
-        "ret_12m": float(ret_12m),
-        "vol_12m": float(vol_12m),
-        "drawdown_12m": float(drawdown_12m),
-        "mom_3m": float(mom_3m),
-        "liq_proxy": float(liq_proxy),
-    }
-    try:
-        r = requests.post(f"{api_url}/predict", json=payload, timeout=30)
-        r.raise_for_status()
-        out = r.json()
-
-        st.metric("Risk probability", f"{out['probability']:.3f}")
-
-        thr = out.get("threshold", active_threshold if active_threshold is not None else 0.5)
-        st.metric(f"Prediction (>= {float(thr):.3f})", out["prediction"])
-
-        st.caption(f"API version: {out.get('api_version', 'n/a')}")
-    except requests.exceptions.RequestException as e:
-        st.error(f"API request failed: {e}")
-
-st.divider()
-
-# -----------------------------
-# Top risk list (FAST via /predict_batch)
-# -----------------------------
-st.header("Top risk companies (scored from local dataset)")
-if data_df is None:
-    st.info(
-        "No local dataset found. Generate one:\n"
-        "- Real market: python -c \"from src.build_dataset import build_market_dataset; build_market_dataset(limit=200, force=False)\"\n"
-        "- Then train: python -m src.train --data .\\data\\processed\\market_firm_features.csv --out .\\models"
-    )
-else:
-    n = st.slider("How many rows to score", min_value=20, max_value=300, value=80, step=20)
-    sample = data_df.head(n).copy()
-    batch_rows = _build_rows_from_df(sample)
-
-    try:
-        with st.spinner("Batch scoring..."):
-            scored = _predict_batch_chunked(api_url, batch_rows, chunk_size=50, timeout=120)
-
-        if "probability" in scored.columns:
-            scored = scored.sort_values("probability", ascending=False)
-
-        st.dataframe(scored.head(25), use_container_width=True)
-    except requests.exceptions.RequestException as e:
-        st.error(f"Batch scoring failed: {e}")
-
-st.divider()
-
-# -----------------------------
-# Batch scoring via CSV upload (FAST via /predict_batch)
-# -----------------------------
-st.header("Batch scoring (CSV upload)")
-st.caption(
-    "CSV must contain: ticker, ret_12m, vol_12m, drawdown_12m, mom_3m, liq_proxy "
-    "(and optional gics_industry_group)."
-)
-
-up = st.file_uploader("Upload CSV", type=["csv"])
-if up is not None:
-    df_up = pd.read_csv(up)
-    st.write("Preview", df_up.head(10))
-
-    if st.button("Score batch upload"):
-        rows = _build_rows_from_df(df_up)
-
-        try:
-            with st.spinner("Batch scoring upload..."):
-                scored = _predict_batch_chunked(api_url, rows, chunk_size=50, timeout=120)
-
-            st.write("Scored", scored)
-            st.download_button(
-                "Download scored CSV",
-                scored.to_csv(index=False),
-                "scored.csv",
-                "text/csv",
-            )
-        except requests.exceptions.RequestException as e:
-            st.error(f"Batch upload scoring failed: {e}")
-
-# -----------------------------
-# Model evaluation (interactive, button-triggered, chunked calls)
-# -----------------------------
-st.divider()
-st.header("Model evaluation (on local dataset)")
-
-# Show training metrics (if available)
-metrics_path = Path("models/metrics.json")
-if metrics_path.exists():
-    try:
-        with open(metrics_path, "r", encoding="utf-8") as f:
-            m = json.load(f)
-        st.caption(
-            f"Training metrics — ROC AUC: {m.get('roc_auc')}, "
-            f"Avg Precision: {m.get('avg_precision')}, "
-            f"Best threshold: {float(m.get('best_threshold', 0.5)):.4f}"
-        )
-    except Exception:
-        st.caption("Training metrics found but could not be read.")
-
-EVAL_CSV = MARKET_CSV if MARKET_CSV.exists() else BASELINE_CSV
-
-if not EVAL_CSV.exists():
-    st.info("No evaluation dataset found.")
-else:
-    eval_df = pd.read_csv(EVAL_CSV)
-
-    if "target_distress_12m" not in eval_df.columns:
-        st.warning("Evaluation needs 'target_distress_12m' column in the dataset.")
-    else:
-        # Prefer API threshold; fall back to 0.5
-        thr = float(active_threshold) if active_threshold is not None else 0.5
-
-        n_eval = st.slider(
-            "Rows to evaluate",
-            min_value=50,
-            max_value=min(500, len(eval_df)),
-            value=min(170, len(eval_df)),
-            step=10,
-        )
-
-        chunk_size = st.sidebar.slider("Eval batch chunk size", 10, 100, 50, 10)
-
-        # Don’t auto-fire evaluation on every rerun.
-        run_eval = st.button("Run evaluation")
-
-        # Cache in session state so slider movement doesn't refetch unless you press button
-        if "eval_cache" not in st.session_state:
-            st.session_state.eval_cache = None
-
-        if run_eval:
-            sample = eval_df.head(n_eval).copy()
-            rows = _build_rows_from_df(sample)
-
-            try:
-                with st.spinner("Scoring evaluation sample via API..."):
-                    scored = _predict_batch_chunked(api_url, rows, chunk_size=int(chunk_size), timeout=180)
-
-                st.session_state.eval_cache = {
-                    "n_eval": int(n_eval),
-                    "threshold": float(thr),
-                    "sample": sample,
-                    "scored": scored,
-                }
-            except requests.exceptions.RequestException as e:
-                st.error(
-                    "Evaluation call failed. Make sure FastAPI is still running on 127.0.0.1:8000 "
-                    "(ideally in a separate terminal). If you run uvicorn with --reload, "
-                    "it can restart mid-request and reset connections.\n\n"
-                    f"Error: {e}"
-                )
-                st.session_state.eval_cache = None
-
-        cache = st.session_state.eval_cache
-        if cache is None:
-            st.info("Click **Run evaluation** to score and render metrics.")
-        else:
-            # Lazy import sklearn only when needed (keeps UI boot fast)
-            try:
-                from sklearn.metrics import (
-                    average_precision_score,
-                    confusion_matrix,
-                    precision_recall_curve,
-                    roc_auc_score,
-                    roc_curve,
-                )
-            except Exception as e:
-                st.error(
-                    "scikit-learn is required for evaluation plots/metrics.\n\n"
-                    "Install it with: `pip install scikit-learn`\n\n"
-                    f"Import error: {e}"
-                )
-                st.stop()
-
-            sample = cache["sample"]
-            scored = cache["scored"]
-            thr = float(cache["threshold"])
-
-            # Align y_true / y_score
-            y_true = sample["target_distress_12m"].astype(int).to_numpy()
-
-            if "probability" not in scored.columns:
-                st.error("API /predict_batch response missing 'probability' column.")
-                st.stop()
-
-            y_score = scored["probability"].astype(float).to_numpy()
-            y_pred = (y_score >= float(thr)).astype(int)
-
-            # Summary metrics
-            pos_rate = float(y_true.mean())
-            c1m, c2m, c3m, c4m = st.columns(4)
-            with c1m:
-                st.metric("Rows evaluated", int(len(sample)))
-            with c2m:
-                st.metric("Positive rate", f"{pos_rate:.3f}")
-            with c3m:
-                st.metric("Threshold", f"{thr:.3f}")
-            with c4m:
-                st.metric("Mean prob", f"{float(np.mean(y_score)):.3f}")
-
-            if len(set(y_true)) > 1:
-                auc = float(roc_auc_score(y_true, y_score))
-                ap = float(average_precision_score(y_true, y_score))
-            else:
-                auc = float("nan")
-                ap = float("nan")
-
-            k1, k2 = st.columns(2)
-            with k1:
-                st.metric("ROC AUC", f"{auc:.3f}" if np.isfinite(auc) else "n/a")
-            with k2:
-                st.metric("Avg Precision", f"{ap:.3f}" if np.isfinite(ap) else "n/a")
+        if len(set(y_true)) > 1:
+            auc = roc_auc_score(y_true, y_score)
+            ap = average_precision_score(y_true, y_score)
+            ev3.metric("ROC AUC (live)", f"{auc:.4f}")
+            ev4.metric("Avg Precision (live)", f"{ap:.4f}")
 
             # Confusion matrix
             cm = confusion_matrix(y_true, y_pred)
-            st.subheader("Confusion matrix (using calibrated threshold)")
-            _plot_confusion_matrix(cm, title="Confusion matrix (calibrated threshold)")
+            fig_cm = px.imshow(cm, text_auto=True, x=["Pred Healthy", "Pred Distress"],
+                               y=["True Healthy", "True Distress"],
+                               color_continuous_scale="Blues", title="Confusion Matrix")
+            fig_cm.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=350)
+            st.plotly_chart(fig_cm, use_container_width=True)
 
-            # Probability distribution
-            st.subheader("Probability distribution")
-            _plot_probability_histogram(y_score, thr, title="Predicted probability distribution")
+            # ROC
+            fpr, tpr, _ = roc_curve(y_true, y_score)
+            fig_roc = go.Figure()
+            fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, name=f"ROC (AUC={auc:.3f})"))
+            fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], line=dict(dash="dash"), name="Chance"))
+            fig_roc.update_layout(title="ROC Curve", xaxis_title="FPR", yaxis_title="TPR",
+                                  margin=dict(l=20, r=20, t=60, b=20), height=400)
+            st.plotly_chart(fig_roc, use_container_width=True)
 
-            # ROC / PR curves (only if both classes exist)
-            if len(set(y_true)) > 1:
-                st.subheader("ROC curve")
-                fpr, tpr, _ = roc_curve(y_true, y_score)
-                _plot_roc_curve(fpr, tpr, auc, title="ROC curve")
+            # PR curve
+            prec, rec, _ = precision_recall_curve(y_true, y_score)
+            fig_pr = go.Figure()
+            fig_pr.add_trace(go.Scatter(x=rec, y=prec, name=f"PR (AP={ap:.3f})"))
+            fig_pr.update_layout(title="Precision-Recall Curve", xaxis_title="Recall",
+                                 yaxis_title="Precision",
+                                 margin=dict(l=20, r=20, t=60, b=20), height=400)
+            st.plotly_chart(fig_pr, use_container_width=True)
+        else:
+            ev3.metric("ROC AUC", "n/a (single class)")
+            ev4.metric("Avg Precision", "n/a")
+            st.info("Only one class present — ROC/PR curves unavailable.")
 
-                st.subheader("Precision-Recall curve")
-                precision, recall, _ = precision_recall_curve(y_true, y_score)
-                _plot_pr_curve(recall, precision, ap, title="Precision-Recall curve")
-            else:
-                st.info("ROC/PR curves unavailable (only one class present in the evaluated sample).")
+# ── TAB 5: FULL DATASET ──
+with tab5:
+    st.header("Full Scored Dataset")
+    st.dataframe(scored, use_container_width=True, height=600)
+    st.download_button("Download scored CSV", scored.to_csv(index=False),
+                       "asx_scored_results.csv", "text/csv")
 
-            # Small EDA explorer chart
-            st.subheader("Quick data explorer (EDA-style)")
-            _plot_feature_scatter(sample, y_true, y_score)
-
-            # Error analysis tables
-            st.subheader("Error analysis")
-
-            scored_view = scored.copy()
-            scored_view["y_true"] = y_true
-            scored_view["y_pred"] = y_pred
-
-            fp = scored_view[(scored_view.y_true == 0) & (scored_view.y_pred == 1)]
-            fn = scored_view[(scored_view.y_true == 1) & (scored_view.y_pred == 0)]
-
-            ec1, ec2 = st.columns(2)
-            with ec1:
-                st.markdown("**False Positives (Pred=1, True=0)**")
-                st.dataframe(fp.head(20), use_container_width=True)
-            with ec2:
-                st.markdown("**False Negatives (Pred=0, True=1)**")
-                st.dataframe(fn.head(20), use_container_width=True)
-
-            st.subheader("Top scored (inspection)")
-            st.dataframe(scored_view.sort_values("probability", ascending=False).head(30), use_container_width=True)
+# ── Footer ──
+st.divider()
+st.caption("ASX/ABS Early Warning Platform | Fahad Amjad | github.com/fahadamjad009/asx-abs-early-warning")
