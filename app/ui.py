@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import shap
 from joblib import load
 
 # ── Paths ──
@@ -46,6 +47,23 @@ def predict_df(model, df, threshold):
                                    labels=["Low", "Medium", "High", "Critical"])
     return result.sort_values("probability", ascending=False)
 
+# ── SHAP explainer ──
+@st.cache_resource
+def get_shap_explainer(_model, data):
+    bg = data[FEATURE_COLS].sample(n=min(20, len(data)), random_state=42).values
+    mode_ticker = data["ticker"].mode().iloc[0]
+    mode_gics = data["gics_industry_group"].mode().iloc[0]
+    def f(X_arr):
+        df = pd.DataFrame(X_arr, columns=FEATURE_COLS)
+        df["ticker"] = mode_ticker
+        df["gics_industry_group"] = mode_gics
+        return _model.predict_proba(df[PREDICT_COLS])[:, 1]
+    return shap.KernelExplainer(f, bg)
+
+@st.cache_data
+def compute_shap_values(_explainer, X_array):
+    return _explainer.shap_values(X_array, nsamples=50, silent=True)
+
 # ── Page config ──
 st.set_page_config(page_title="ASX/ABS Early Warning", page_icon="📊", layout="wide")
 
@@ -55,13 +73,9 @@ metrics = load_metrics()
 data = load_data()
 threshold = float(metrics.get("best_threshold", 0.5))
 
-# ══════════════════════════════════════════
-# HEADER
-# ══════════════════════════════════════════
 st.markdown("# 📊 ASX/ABS Early Warning — Risk Scoring Platform")
 st.caption("Production-style financial risk analytics combining ASX market signals with macroeconomic context.")
 
-# ── Hero metrics ──
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Companies", len(data) if data is not None else 0)
 m2.metric("Calibrated Threshold", f"{threshold:.4f}")
@@ -75,14 +89,14 @@ if data is None:
     st.error("No dataset found at data/processed/market_firm_features.csv")
     st.stop()
 
-# ══════════════════════════════════════════
-# SCORE ALL COMPANIES
-# ══════════════════════════════════════════
 scored = predict_df(model, data, threshold)
 
-# ══════════════════════════════════════════
-# TAB LAYOUT
-# ══════════════════════════════════════════
+# Compute SHAP once (cached)
+with st.spinner("Computing SHAP values (first run only)..."):
+    explainer = get_shap_explainer(model, data)
+    shap_vals = compute_shap_values(explainer, data[FEATURE_COLS].values)
+    expected_value = float(explainer.expected_value)
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🏠 Risk Overview", "🔍 Company Lookup", "📈 Market Analysis",
     "🧪 Model Evaluation", "📋 Full Dataset"
@@ -91,15 +105,12 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ── TAB 1: RISK OVERVIEW ──
 with tab1:
     st.header("Risk Overview")
-
-    # Top risk companies
     col_a, col_b = st.columns([2, 1])
     with col_a:
         st.subheader("Top 15 Highest-Risk Companies")
         top = scored.head(15)[["ticker", "gics_industry_group", "probability", "risk_level",
                                 "ret_12m", "drawdown_12m", "vol_12m"]].reset_index(drop=True)
         st.dataframe(top, use_container_width=True, height=400)
-
     with col_b:
         st.subheader("Risk Distribution")
         risk_counts = scored["risk_level"].value_counts()
@@ -111,15 +122,11 @@ with tab1:
         fig_pie.update_layout(margin=dict(l=10, r=10, t=30, b=10), height=400)
         st.plotly_chart(fig_pie, use_container_width=True)
 
-    # Sector risk heatmap
     st.subheader("Sector Risk Heatmap")
     sector_stats = scored.groupby("gics_industry_group").agg(
-        avg_risk=("probability", "mean"),
-        max_risk=("probability", "max"),
-        count=("ticker", "count"),
-        avg_drawdown=("drawdown_12m", "mean"),
+        avg_risk=("probability", "mean"), max_risk=("probability", "max"),
+        count=("ticker", "count"), avg_drawdown=("drawdown_12m", "mean"),
     ).sort_values("avg_risk", ascending=False).reset_index()
-
     fig_hm = px.bar(sector_stats, x="gics_industry_group", y="avg_risk",
                     color="avg_risk", color_continuous_scale="RdYlGn_r",
                     hover_data=["max_risk", "count", "avg_drawdown"],
@@ -128,7 +135,6 @@ with tab1:
                          margin=dict(l=20, r=20, t=60, b=80), height=400)
     st.plotly_chart(fig_hm, use_container_width=True)
 
-    # Probability distribution
     st.subheader("Risk Score Distribution")
     fig_hist = px.histogram(scored, x="probability", nbins=30, marginal="box",
                             color_discrete_sequence=["#3498db"],
@@ -143,7 +149,6 @@ with tab2:
     st.header("Single Company Risk Scoring")
     tickers = sorted(scored["ticker"].unique().tolist())
     selected = st.selectbox("Select a company", tickers)
-
     row = scored[scored["ticker"] == selected].iloc[0]
 
     lc1, lc2, lc3, lc4 = st.columns(4)
@@ -159,7 +164,29 @@ with tab2:
     fc4.metric("Momentum 3m", f"{row['mom_3m']:.2%}")
     fc5.metric("Liquidity", f"{row['liq_proxy']:.4f}")
 
-    # Peer comparison
+    # SHAP waterfall for selected company
+    st.subheader("Why this score? — SHAP Feature Contributions")
+    company_idx = data.index[data["ticker"] == selected][0]
+    company_shap = shap_vals[company_idx]
+    company_features = data.loc[company_idx, FEATURE_COLS]
+    waterfall_df = pd.DataFrame({
+        "feature": FEATURE_COLS,
+        "value": company_features.values,
+        "shap": company_shap,
+    }).sort_values("shap", key=abs, ascending=True)
+    fig_wf = go.Figure(go.Bar(
+        x=waterfall_df["shap"],
+        y=[f"{f} = {v:.4f}" for f, v in zip(waterfall_df["feature"], waterfall_df["value"])],
+        orientation="h",
+        marker_color=["#e74c3c" if v > 0 else "#3498db" for v in waterfall_df["shap"]],
+        text=[f"{v:+.4f}" for v in waterfall_df["shap"]], textposition="outside",
+    ))
+    fig_wf.update_layout(
+        title=f"SHAP contributions for {selected} (base value: {expected_value:.4f}) — red increases risk, blue reduces",
+        xaxis_title="SHAP value (impact on risk probability)",
+        margin=dict(l=20, r=20, t=60, b=20), height=350)
+    st.plotly_chart(fig_wf, use_container_width=True)
+
     st.subheader("Peer Comparison (Same Sector)")
     peers = scored[scored["gics_industry_group"] == row["gics_industry_group"]]
     fig_peer = px.bar(peers.sort_values("probability", ascending=False),
@@ -170,7 +197,6 @@ with tab2:
     fig_peer.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=380)
     st.plotly_chart(fig_peer, use_container_width=True)
 
-    # Manual scoring
     st.subheader("Custom Input Scoring")
     with st.expander("Enter custom values"):
         cc1, cc2, cc3 = st.columns(3)
@@ -184,7 +210,6 @@ with tab2:
         with cc3:
             c_mom = st.number_input("Momentum 3m", value=0.0, format="%.4f")
             c_liq = st.number_input("Liquidity proxy", value=1.0, format="%.4f")
-
         if st.button("Score Custom Input"):
             custom = pd.DataFrame([{
                 "ticker": c_ticker, "gics_industry_group": c_gics,
@@ -199,8 +224,6 @@ with tab2:
 # ── TAB 3: MARKET ANALYSIS ──
 with tab3:
     st.header("Market-Wide Analysis")
-
-    # Scatter: Return vs Drawdown
     st.subheader("Return vs Drawdown (bubble = risk probability)")
     fig_sc = px.scatter(scored, x="drawdown_12m", y="ret_12m",
                         size=np.clip(scored["probability"], 0.05, 1.0),
@@ -212,7 +235,6 @@ with tab3:
     fig_sc.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=500)
     st.plotly_chart(fig_sc, use_container_width=True)
 
-    # Volatility vs Momentum
     st.subheader("Volatility vs Momentum")
     fig_vm = px.scatter(scored, x="vol_12m", y="mom_3m",
                         color="probability", color_continuous_scale="RdYlGn_r",
@@ -221,7 +243,6 @@ with tab3:
     fig_vm.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=450)
     st.plotly_chart(fig_vm, use_container_width=True)
 
-    # Feature correlation
     st.subheader("Feature Correlation Matrix")
     corr = scored[FEATURE_COLS + ["probability"]].corr()
     fig_corr = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r",
@@ -233,14 +254,46 @@ with tab3:
 with tab4:
     st.header("Model Evaluation")
 
+    # Global SHAP importance
+    st.subheader("Global Feature Importance (mean |SHAP|)")
+    global_importance = pd.DataFrame({
+        "feature": FEATURE_COLS,
+        "importance": np.abs(shap_vals).mean(axis=0),
+    }).sort_values("importance", ascending=True)
+    fig_gi = px.bar(global_importance, x="importance", y="feature", orientation="h",
+                    color="importance", color_continuous_scale="Reds",
+                    title="Mean |SHAP value| across all companies")
+    fig_gi.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=350,
+                         showlegend=False)
+    st.plotly_chart(fig_gi, use_container_width=True)
+
+    # SHAP beeswarm-style scatter (jittered)
+    st.subheader("SHAP Value Distribution by Feature")
+    shap_long = pd.DataFrame(shap_vals, columns=FEATURE_COLS).melt(
+        var_name="feature", value_name="shap_value")
+    feat_long = data[FEATURE_COLS].melt(var_name="feature", value_name="feature_value")
+    shap_long["feature_value"] = feat_long["feature_value"]
+    rng = np.random.default_rng(42)
+    shap_long["y_jitter"] = pd.Categorical(shap_long["feature"], categories=FEATURE_COLS).codes \
+                            + rng.uniform(-0.25, 0.25, len(shap_long))
+    fig_bs = px.scatter(shap_long, x="shap_value", y="y_jitter", color="feature_value",
+                        color_continuous_scale="RdYlBu_r",
+                        hover_data=["feature"],
+                        title="SHAP impact per company (color = feature value)")
+    fig_bs.update_yaxes(tickmode="array",
+                        tickvals=list(range(len(FEATURE_COLS))),
+                        ticktext=FEATURE_COLS, title="")
+    fig_bs.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=400)
+    st.plotly_chart(fig_bs, use_container_width=True)
+
+    st.divider()
+
     if "target_distress_12m" not in scored.columns:
         st.warning("No target column (target_distress_12m) in dataset — evaluation metrics unavailable.")
         st.info("Training metrics from models/metrics.json are shown in the header.")
     else:
         from sklearn.metrics import (confusion_matrix, roc_auc_score, roc_curve,
-                                     precision_recall_curve, average_precision_score,
-                                     classification_report)
-
+                                     precision_recall_curve, average_precision_score)
         y_true = scored["target_distress_12m"].astype(int).values
         y_score = scored["probability"].values
         y_pred = scored["prediction"].values
@@ -255,7 +308,6 @@ with tab4:
             ev3.metric("ROC AUC (live)", f"{auc:.4f}")
             ev4.metric("Avg Precision (live)", f"{ap:.4f}")
 
-            # Confusion matrix
             cm = confusion_matrix(y_true, y_pred)
             fig_cm = px.imshow(cm, text_auto=True, x=["Pred Healthy", "Pred Distress"],
                                y=["True Healthy", "True Distress"],
@@ -263,7 +315,6 @@ with tab4:
             fig_cm.update_layout(margin=dict(l=20, r=20, t=60, b=20), height=350)
             st.plotly_chart(fig_cm, use_container_width=True)
 
-            # ROC
             fpr, tpr, _ = roc_curve(y_true, y_score)
             fig_roc = go.Figure()
             fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, name=f"ROC (AUC={auc:.3f})"))
@@ -272,7 +323,6 @@ with tab4:
                                   margin=dict(l=20, r=20, t=60, b=20), height=400)
             st.plotly_chart(fig_roc, use_container_width=True)
 
-            # PR curve
             prec, rec, _ = precision_recall_curve(y_true, y_score)
             fig_pr = go.Figure()
             fig_pr.add_trace(go.Scatter(x=rec, y=prec, name=f"PR (AP={ap:.3f})"))
@@ -292,6 +342,5 @@ with tab5:
     st.download_button("Download scored CSV", scored.to_csv(index=False),
                        "asx_scored_results.csv", "text/csv")
 
-# ── Footer ──
 st.divider()
 st.caption("ASX/ABS Early Warning Platform | Fahad Amjad | github.com/fahadamjad009/asx-abs-early-warning")
