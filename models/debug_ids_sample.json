@@ -1,0 +1,67 @@
+{
+  "id_cols": [
+    "ticker"
+  ],
+  "head": [
+    {
+      "ticker": "14D"
+    },
+    {
+      "ticker": "1AD"
+    },
+    {
+      "ticker": "1AE"
+    },
+    {
+      "ticker": "1AI"
+    },
+    {
+      "ticker": "1CG"
+    },
+    {
+      "ticker": "1MC"
+    },
+    {
+      "ticker": "1TT"
+    },
+    {
+      "ticker": "29M"
+    },
+    {
+      "ticker": "360"
+    },
+    {
+      "ticker": "3DA"
+    },
+    {
+      "ticker": "3DP"
+    },
+    {
+      "ticker": "3PL"
+    },
+    {
+      "ticker": "4DS"
+    },
+    {
+      "ticker": "4DX"
+    },
+    {
+      "ticker": "5EA"
+    },
+    {
+      "ticker": "5GG"
+    },
+    {
+      "ticker": "5GN"
+    },
+    {
+      "ticker": "88E"
+    },
+    {
+      "ticker": "8CO"
+    },
+    {
+      "ticker": "8IH"
+    }
+  ]
+}
